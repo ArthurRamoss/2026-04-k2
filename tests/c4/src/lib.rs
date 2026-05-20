@@ -657,3 +657,86 @@ fn invariant_fuzz_solvency_and_hf() {
         }
     }
 }
+
+// =============================================================================
+// PoC — Blend-H-01 class (Soroban same-tx stale-reserve / update_state_without_store).
+// swap_collateral updates both reserves with `update_state_without_store` (the new index
+// is held in memory and NOT persisted until the end of the call). This is exactly the
+// Soroban load/cache/store discipline whose violation caused Blend V2 H-01. We route a
+// swap through a whitelisted handler and assert the per-reserve solvency invariant holds
+// across the un-stored window — any stale-stored-index accounting drift would break it.
+// =============================================================================
+
+#[soroban_sdk::contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum MockHandlerError {
+    Fail = 1,
+}
+
+#[contract]
+pub struct MockSwapHandler;
+
+#[contractimpl]
+impl MockSwapHandler {
+    /// Benign 1:1 swap: delivers `amount_in` of `to_token` to `recipient`
+    /// (both Setup assets are $1.00 at 7 decimals, so 1:1 is fair).
+    pub fn execute_swap(
+        env: Env,
+        _from_token: Address,
+        to_token: Address,
+        amount_in: u128,
+        min_amount_out: u128,
+        recipient: Address,
+    ) -> Result<u128, MockHandlerError> {
+        let out = amount_in;
+        if out < min_amount_out {
+            return Err(MockHandlerError::Fail);
+        }
+        token::Client::new(&env, &to_token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &(out as i128),
+        );
+        Ok(out)
+    }
+}
+
+#[test]
+fn poc_swap_collateral_conservation_via_handler() {
+    let env = Env::default();
+    let setup = Setup::new(&env);
+
+    // User supplies a large asset_a position to swap from.
+    let supply_amt: u128 = 5_000_000_000; // 500 tokens @7dp
+    setup
+        .router
+        .supply(&setup.user, &setup.asset_a, &supply_amt, &setup.user, &0u32);
+
+    // Deploy + fund + whitelist a benign 1:1 swap handler (holds asset_b to deliver).
+    let handler = env.register(MockSwapHandler, ());
+    setup.asset_b_mint.mint(&handler, &100_000_000_000i128);
+    let mut wl = Vec::new(&env);
+    wl.push_back(handler.clone());
+    setup.router.set_swap_handler_whitelist(&wl);
+
+    assert_conservation(&env, &setup.router, &setup.asset_a, &setup.a_token_a, &setup.debt_token_a, &setup.asset_a_token, "A-pre", 0);
+    assert_conservation(&env, &setup.router, &setup.asset_b, &setup.a_token_b, &setup.debt_token_b, &setup.asset_b_token, "B-pre", 0);
+
+    // swap_collateral asset_a -> asset_b through the handler (uses update_state_without_store).
+    let swap_amt: u128 = 2_000_000_000; // 200 tokens
+    let min_out: u128 = 1_000_000_000; // 100 tokens (1:1 minus fee)
+    let r = setup.router.try_swap_collateral(
+        &setup.user,
+        &setup.asset_a,
+        &setup.asset_b,
+        &swap_amt,
+        &min_out,
+        &Some(handler.clone()),
+    );
+    assert!(matches!(r, Ok(Ok(_))), "swap_collateral via handler should succeed; got {:?}", r);
+
+    // KEY: solvency invariant must still hold on BOTH reserves after the without_store swap.
+    assert_conservation(&env, &setup.router, &setup.asset_a, &setup.a_token_a, &setup.debt_token_a, &setup.asset_a_token, "A-post", 1);
+    assert_conservation(&env, &setup.router, &setup.asset_b, &setup.a_token_b, &setup.debt_token_b, &setup.asset_b_token, "B-post", 1);
+}
