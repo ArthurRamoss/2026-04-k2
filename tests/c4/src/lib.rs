@@ -517,3 +517,143 @@ fn test_submission_validity() {
     //     let post = setup.router.get_user_account_data(&setup.user);
     //     assert!(post.health_factor < k2_shared::WAD, "bug: HF below 1.0");
 }
+
+// =============================================================================
+// Dynamic invariant fuzz (audit Round 5 — dynamic lens).
+// Drives a deterministic pseudo-random sequence of supply/borrow/withdraw/repay
+// across both reserves with interest accrual between ops, asserting the crown
+// solvency invariant after every step:
+//     aToken_scaled * liquidity_index / RAY  <=  underlying_balance + debt_scaled * borrow_index / RAY  (+ rounding slack)
+// and that no *successful* borrow/withdraw leaves the actor with HF < 1.0 WAD.
+// =============================================================================
+
+const RAY_U128: u128 = 1_000_000_000_000_000_000_000_000_000; // 1e27
+const WAD_U128: u128 = 1_000_000_000_000_000_000; // 1e18
+
+fn u256(env: &Env, v: u128) -> soroban_sdk::U256 {
+    soroban_sdk::U256::from_u128(env, v)
+}
+
+fn nn(v: i128) -> u128 {
+    if v < 0 { 0 } else { v as u128 }
+}
+
+fn assert_conservation(
+    env: &Env,
+    router: &kinetic_router::Client,
+    asset: &Address,
+    a_addr: &Address,
+    d_addr: &Address,
+    underlying: &token::Client,
+    label: &str,
+    step: u32,
+) {
+    let rd = router.get_reserve_data(asset);
+    let li = u256(env, rd.liquidity_index);
+    let bi = u256(env, rd.variable_borrow_index);
+    let ray = u256(env, RAY_U128);
+
+    let a_scaled = nn(a_token::Client::new(env, a_addr).scaled_total_supply());
+    let d_scaled = nn(debt_token::Client::new(env, d_addr).scaled_total_supply());
+    let und = nn(underlying.balance(a_addr));
+
+    // LHS = total aToken claims valued at the current liquidity index
+    let lhs = u256(env, a_scaled).mul(&li).div(&ray);
+    // RHS = real underlying held by the aToken + outstanding debt valued at the borrow index
+    let debt_val = u256(env, d_scaled).mul(&bi).div(&ray);
+    let rhs = u256(env, und).add(&debt_val);
+
+    // Allow a few units of rounding slack (scaled mint/burn round in the protocol's favor).
+    let tol = u256(env, 10_000u128);
+    assert!(
+        lhs <= rhs.add(&tol),
+        "SOLVENCY INVARIANT BROKEN [{}] at step {}: aToken_value exceeds underlying+debt_value (a_scaled={}, d_scaled={}, underlying={})",
+        label, step, a_scaled, d_scaled, und
+    );
+}
+
+#[test]
+fn invariant_fuzz_solvency_and_hf() {
+    let env = Env::default();
+    let setup = Setup::new(&env);
+
+    // Top up the user and refresh approvals so a long op sequence isn't starved.
+    setup.asset_a_mint.mint(&setup.user, &1_000_000_000_000i128);
+    setup.asset_b_mint.mint(&setup.user, &1_000_000_000_000i128);
+    let exp = env.ledger().sequence() + 100_000;
+    setup.asset_a_token.approve(&setup.user, &setup.router_addr, &2_000_000_000_000i128, &exp);
+    setup.asset_b_token.approve(&setup.user, &setup.router_addr, &2_000_000_000_000i128, &exp);
+
+    // Second actor so two independent accounts churn shared reserve state.
+    setup.asset_a_mint.mint(&setup.liquidity_provider, &1_000_000_000_000i128);
+    setup.asset_b_mint.mint(&setup.liquidity_provider, &1_000_000_000_000i128);
+    setup.asset_a_token.approve(&setup.liquidity_provider, &setup.router_addr, &2_000_000_000_000i128, &exp);
+    setup.asset_b_token.approve(&setup.liquidity_provider, &setup.router_addr, &2_000_000_000_000i128, &exp);
+
+    let actors = [setup.user.clone(), setup.liquidity_provider.clone()];
+    let asset_a_enum = OracleAsset::Stellar(setup.asset_a.clone());
+    let asset_b_enum = OracleAsset::Stellar(setup.asset_b.clone());
+    let seeds: [u64; 8] = [
+        0x9E3779B97F4A7C15, 0xD1B54A32D192ED03, 0xCBF29CE484222325, 0x0000000100000001,
+        0xA0761D6478BD642F, 0xE7037ED1A0B428DB, 0x8EBC6AF09C88C6E3, 0x589965CC75374CC3,
+    ];
+    let mut seq: u32 = 200;
+    let mut ts: u64 = 1_000;
+
+    for &s0 in seeds.iter() {
+        let mut seed = s0;
+        for i in 0..120u32 {
+            // Advance the ledger, then refresh both oracle overrides so prices stay fresh
+            // at the new timestamp (otherwise staleness checks reject every price-dependent op).
+            seq += 1;
+            ts += 1_800;
+            env.ledger().set(LedgerInfo {
+                sequence_number: seq,
+                protocol_version: 23,
+                timestamp: ts,
+                network_id: Default::default(),
+                base_reserve: 10,
+                min_temp_entry_ttl: 10,
+                min_persistent_entry_ttl: 10,
+                max_entry_ttl: 1_000_000,
+            });
+            setup.oracle.set_manual_override(&setup.admin, &asset_a_enum, &Some(PRICE_ONE_DOLLAR), &Some(ts + 86_400));
+            setup.oracle.set_manual_override(&setup.admin, &asset_b_enum, &Some(PRICE_ONE_DOLLAR), &Some(ts + 86_400));
+
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let op = (seed >> 41) % 4;
+            let actor = &actors[((seed >> 5) & 1) as usize];
+            let asset = if ((seed >> 3) & 1) == 0 { &setup.asset_a } else { &setup.asset_b };
+            // Mostly modest amounts; sometimes dust (1) or the u128::MAX "all" sentinel.
+            let amt: u128 = match (seed >> 9) % 8 {
+                0 => 1,
+                1 => u128::MAX,
+                _ => ((seed >> 13) % 2_000_000_000u64) as u128 + 1,
+            };
+
+            let mut did_risky_ok = false;
+            match op {
+                0 => { let _ = setup.router.try_supply(actor, asset, &amt, actor, &0u32); }
+                1 => { let r = setup.router.try_borrow(actor, asset, &amt, &1u32, &0u32, actor); did_risky_ok = matches!(r, Ok(Ok(_))); }
+                2 => { let r = setup.router.try_withdraw(actor, asset, &amt, actor); did_risky_ok = matches!(r, Ok(Ok(_))); }
+                _ => { let _ = setup.router.try_repay(actor, asset, &amt, &1u32, actor); }
+            }
+
+            // A SUCCESSFUL borrow/withdraw must leave the actor with HF >= 1.0 WAD.
+            if did_risky_ok {
+                let acct = setup.router.get_user_account_data(actor);
+                assert!(
+                    acct.health_factor >= WAD_U128,
+                    "HF INVARIANT BROKEN (seed {:#x}, step {}): successful borrow/withdraw left HF={} < 1.0 WAD",
+                    s0, i, acct.health_factor
+                );
+            }
+
+            // Crown solvency invariant must hold after every op (success or revert).
+            assert_conservation(&env, &setup.router, &setup.asset_a, &setup.a_token_a, &setup.debt_token_a, &setup.asset_a_token, "A", i);
+            assert_conservation(&env, &setup.router, &setup.asset_b, &setup.a_token_b, &setup.debt_token_b, &setup.asset_b_token, "B", i);
+        }
+    }
+}
