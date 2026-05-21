@@ -915,3 +915,291 @@ fn poc_swap_collateral_conservation_via_handler() {
     assert_conservation(&env, &setup.router, &setup.asset_a, &setup.a_token_a, &setup.debt_token_a, &setup.asset_a_token, "A-post", 1);
     assert_conservation(&env, &setup.router, &setup.asset_b, &setup.a_token_b, &setup.debt_token_b, &setup.asset_b_token, "B-post", 1);
 }
+
+// =============================================================================
+// PoC — drop_reserve vs. live bad-debt deficit reachability.
+//
+// SEAM (kinetic-router/src/reserve.rs:437):
+//   drop_reserve() panics with CannotDropActiveReserve unless BOTH
+//   a_token.scaled_total_supply() == 0 (line 454) AND
+//   debt_token.scaled_total_supply() == 0 (line 467).
+//   It NEVER inspects reserve_deficit, yet unconditionally REMOVES the deficit
+//   storage key (lines 496-499). So IF a reserve could ever be in the state
+//   {a_scaled==0 && debt_scaled==0 && deficit>0}, dropping it would silently
+//   erase a live bad-debt record (permanent, unrecoverable accounting loss:
+//   cover_deficit can no longer be called, and the shortfall is forgotten).
+//
+// HYPOTHESIS (to confirm or refute):
+//   That state is UNREACHABLE. A deficit is born at liquidation.rs:610
+//   (add_reserve_deficit) as a "cover-later IOU" that, by design (comment
+//   line 609), does NOT write down liquidity_index and does NOT burn supplier
+//   aTokens. The reserve is therefore physically short of underlying by exactly
+//   `deficit`. Suppliers collectively cannot withdraw their full principal, so
+//   a_token.scaled_total_supply() can never reach 0 while deficit>0 -> the
+//   drop_reserve guard stays armed -> the dangerous erase path is unreachable.
+//
+// This test constructs a REAL bad-debt liquidation on a fresh, single-supplier
+// reserve D, then probes both the supplier's max withdrawal and the actual
+// drop_reserve outcome.
+// =============================================================================
+
+#[test]
+fn poc_deficit_drop_reserve_reachability() {
+    let env = Env::default();
+    let setup = Setup::new(&env);
+
+    // Roles:
+    //   collateral reserve  = asset_a (Setup high-quality collateral, $1.00)
+    //   debt/deficit reserve = D (fresh, borrowable, single supplier)
+    //   supplier S          = sole liquidity provider of D
+    //   borrower  B         = setup.user (collateral in A, debt in D)
+    //   liquidator L        = repays B's D debt during liquidation
+    let supplier_s = Address::generate(&env);
+    let borrower_b = setup.user.clone();
+    let liquidator_l = Address::generate(&env);
+
+    // ---- Reserve D: fresh borrowable reserve, $1.00, 5% liq bonus. ----
+    let (asset_d, a_token_d, debt_token_d) = register_extra_reserve(&env, &setup, 8000, 8500);
+    let asset_d_mint = token::StellarAssetClient::new(&env, &asset_d);
+    let asset_d_token = token::Client::new(&env, &asset_d);
+    let exp = env.ledger().sequence() + 100_000;
+
+    // ---- S supplies a clean, isolated amount of D (100 tokens @7dp). ----
+    // Because D is brand new and S is the only supplier, a_token_d.scaled_total_supply
+    // equals exactly S's deposit -> the "can a_token reach 0?" question is unambiguous.
+    let s_supply: u128 = 1_000_000_000; // 100 D @ $1
+    asset_d_mint.mint(&supplier_s, &(s_supply as i128));
+    asset_d_token.approve(&supplier_s, &setup.router_addr, &(s_supply as i128), &exp);
+    setup
+        .router
+        .supply(&supplier_s, &asset_d, &s_supply, &supplier_s, &0u32);
+
+    let a_scaled_after_supply = a_token::Client::new(&env, &a_token_d).scaled_total_supply();
+    assert_eq!(
+        a_scaled_after_supply, s_supply as i128,
+        "D's aToken scaled supply should equal S's lone deposit"
+    );
+
+    // ---- B supplies collateral in A and borrows D against it. ----
+    // B supplies 100 A ($100 collateral, LTV 80% -> max borrow $80).
+    let b_collateral: u128 = 1_000_000_000; // 100 A @ $1
+    setup
+        .router
+        .supply(&borrower_b, &setup.asset_a, &b_collateral, &borrower_b, &0u32);
+    // Borrow 70 D (within the $80 limit). Variable mode (1).
+    let b_borrow: u128 = 700_000_000; // 70 D @ $1
+    setup.router.borrow(
+        &borrower_b,
+        &asset_d,
+        &b_borrow,
+        &1u32,
+        &0u32,
+        &borrower_b,
+    );
+
+    let debt_scaled_after_borrow = debt_token::Client::new(&env, &debt_token_d).scaled_total_supply();
+    assert!(
+        debt_scaled_after_borrow > 0,
+        "B should have outstanding D debt after borrowing"
+    );
+
+    // ---- Crash A's price so seizing ALL of B's collateral cannot cover the debt. ----
+    // Drive collateral_cap_triggered: collateral_amount_to_transfer (debt*bonus/price)
+    // must exceed B's collateral balance. We step the price DOWN in <=20% increments
+    // because the oracle's circuit breaker (DEFAULT_MAX_PRICE_CHANGE_BPS = 2000) rejects
+    // any single manual override that deviates more than 20% from the last queried price.
+    // Each step we query get_asset_price to commit the new value as the circuit-breaker
+    // baseline, then drop again. Final target ~$0.45: B's 100 A is worth $45 while debt
+    // is $70 -> even seizing ALL collateral (with the 5% bonus) covers only ~$43 of debt,
+    // leaving ~$27 of unrecoverable bad debt -> socialized to deficit(D).
+    let asset_a_enum = OracleAsset::Stellar(setup.asset_a.clone());
+    let price_steps: [u128; 5] = [
+        (PRICE_ONE_DOLLAR * 82) / 100, // $0.82  (-18%)
+        (PRICE_ONE_DOLLAR * 68) / 100, // $0.68  (-17%)
+        (PRICE_ONE_DOLLAR * 57) / 100, // $0.57  (-16%)
+        (PRICE_ONE_DOLLAR * 49) / 100, // $0.49  (-14%)
+        (PRICE_ONE_DOLLAR * 45) / 100, // $0.45  (-8%)
+    ];
+    // NOTE: we bump only the ledger SEQUENCE, never the timestamp. Keeping the timestamp
+    // fixed means D's variable_borrow_index stays at RAY through the liquidation (no
+    // interest accrues), so the debt burns are exact and B's debt can reach exactly 0 —
+    // giving the cleanest possible test of the {a==0 && debt==0 && deficit>0} state.
+    let mut step_seq = env.ledger().sequence();
+    let step_ts = env.ledger().timestamp();
+    for p in price_steps.iter() {
+        step_seq += 1;
+        env.ledger().set(LedgerInfo {
+            sequence_number: step_seq,
+            protocol_version: 23,
+            timestamp: step_ts,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 1_000_000,
+        });
+        setup.oracle.set_manual_override(
+            &setup.admin,
+            &asset_a_enum,
+            &Some(*p),
+            &Some(step_ts + 604_800),
+        );
+        // Commit *p as the new circuit-breaker baseline by resolving a price query.
+        let _ = setup.oracle.get_asset_price(&asset_a_enum);
+    }
+
+    // Sanity: B is now liquidatable (HF < 1.0 WAD).
+    let b_acct = setup.router.get_user_account_data(&borrower_b);
+    assert!(
+        b_acct.health_factor < WAD_U128,
+        "B must be underwater after the A price crash; HF={}",
+        b_acct.health_factor
+    );
+
+    // ---- Liquidator repays B's FULL D debt (close factor 100% when HF very low). ----
+    // Fund L with enough D to repay the whole debt; the seize is collateral-capped so
+    // the actually-charged debt_to_cover is reduced internally, the rest is bad debt.
+    let l_funding: u128 = 1_000_000_000; // 100 D, more than enough
+    asset_d_mint.mint(&liquidator_l, &(l_funding as i128));
+    asset_d_token.approve(&liquidator_l, &setup.router_addr, &(l_funding as i128), &exp);
+
+    let liq_res = setup.router.try_liquidation_call(
+        &liquidator_l,
+        &setup.asset_a, // collateral to seize
+        &asset_d,       // debt to repay
+        &borrower_b,    // user being liquidated
+        &b_borrow,      // cover full debt
+        &false,         // receive underlying, not aToken
+    );
+    assert!(
+        matches!(liq_res, Ok(Ok(_))),
+        "bad-debt liquidation should succeed; got {:?}",
+        liq_res
+    );
+
+    // ---- Confirm the bad-debt state we set out to create. ----
+    let deficit_d = setup.router.get_reserve_deficit(&asset_d);
+    let debt_scaled_after_liq =
+        debt_token::Client::new(&env, &debt_token_d).scaled_total_supply();
+    let a_scaled_after_liq = a_token::Client::new(&env, &a_token_d).scaled_total_supply();
+
+    println!("--- post-liquidation state of reserve D ---");
+    println!("reserve_deficit(D)         = {}", deficit_d);
+    println!("debt_token D scaled_supply = {}", debt_scaled_after_liq);
+    println!("a_token   D scaled_supply  = {}", a_scaled_after_liq);
+
+    assert!(
+        deficit_d > 0,
+        "EXPECTED bad-debt deficit on D was not created (got 0). \
+         collateral_cap_triggered path may not have fired."
+    );
+    assert_eq!(
+        debt_scaled_after_liq, 0,
+        "B's debt should be fully cleared (socialized to deficit), so D debt scaled supply == 0"
+    );
+    // S never withdrew yet, so the only aToken supply is still S's principal.
+    assert_eq!(
+        a_scaled_after_liq, s_supply as i128,
+        "S's aToken position is untouched by the deficit socialization (no write-down)"
+    );
+
+    // ---- Probe: can supplier S withdraw ALL of D? ----
+    // The reserve is physically short by `deficit`. The aToken contract only holds the
+    // underlying NOT lent out / NOT seized. After the liquidation, the underlying that
+    // backed B's borrow is gone (it went to B, then collateral seizure paid only a sliver
+    // back). So a full withdrawal of S's principal must fail for lack of underlying.
+    let underlying_in_atoken = asset_d_token.balance(&a_token_d);
+    println!("underlying held by aToken D = {}", underlying_in_atoken);
+
+    // Attempt to withdraw EVERYTHING (u128::MAX sentinel = "all").
+    let withdraw_all_res =
+        setup
+            .router
+            .try_withdraw(&supplier_s, &asset_d, &u128::MAX, &supplier_s);
+    println!("withdraw-ALL result        = {:?}", withdraw_all_res);
+
+    let a_scaled_after_withdraw_attempt =
+        a_token::Client::new(&env, &a_token_d).scaled_total_supply();
+    println!(
+        "a_token D scaled_supply after withdraw attempt = {}",
+        a_scaled_after_withdraw_attempt
+    );
+
+    // Regardless of whether the "all" withdrawal reverts or only drains the available
+    // underlying, S CANNOT zero out the aToken supply while the reserve is short.
+    assert!(
+        a_scaled_after_withdraw_attempt != 0,
+        "REFUTED-PREMISE: a_token scaled supply reached 0 despite a live deficit. \
+         If this triggers, the drop_reserve guard could be bypassed."
+    );
+
+    // ---- The decisive probe: attempt drop_reserve(D) with deficit still live. ----
+    let drop_res = setup
+        .router
+        .try_drop_reserve(&setup.pool_configurator, &asset_d);
+    println!("drop_reserve(D) result      = {:?}", drop_res);
+
+    let deficit_after_drop = setup.router.get_reserve_deficit(&asset_d);
+    println!("reserve_deficit(D) after drop = {}", deficit_after_drop);
+
+    // ---- Verdict ----
+    // HYPOTHESIS CONFIRMED if drop_reserve is BLOCKED (Err) while deficit stays > 0:
+    //   the dangerous {a==0 && debt==0 && deficit>0} state is unreachable, and the
+    //   missing deficit check in drop_reserve is an unreachable footgun (QA-Info).
+    // HYPOTHESIS REFUTED if drop_reserve SUCCEEDS and the deficit is erased:
+    //   that would be a real loss-of-bad-debt-record finding.
+    match drop_res {
+        Ok(Ok(())) => {
+            // drop_reserve succeeded. If the deficit was non-zero before and is now
+            // gone, the IOU was silently erased -> REAL finding.
+            assert_eq!(
+                deficit_after_drop, 0,
+                "drop succeeded; deficit storage key is removed by drop_reserve"
+            );
+            panic!(
+                "HYPOTHESIS REFUTED: drop_reserve(D) SUCCEEDED while a live deficit of {} \
+                 existed, erasing the bad-debt record (now {}). This is a real finding: \
+                 a reserve with outstanding socialized bad debt can be dropped, permanently \
+                 destroying the deficit accounting and any future cover_deficit recovery.",
+                deficit_d, deficit_after_drop
+            );
+        }
+        Ok(Err(_)) | Err(_) => {
+            // drop_reserve was blocked. Confirm the guard fired for the documented reason
+            // (a_token scaled supply != 0) and that the deficit is UNTOUCHED.
+            assert!(
+                a_scaled_after_withdraw_attempt != 0,
+                "guard should be tripped by non-zero a_token scaled supply"
+            );
+            assert_eq!(
+                deficit_after_drop, deficit_d,
+                "deficit must be untouched when drop_reserve is correctly blocked"
+            );
+            // The panic raised is ReserveManagementError::CannotDropActiveReserve (reserve.rs:455).
+            // NOTE the contract-error-code COLLISION: that variant is repr code #2
+            // (shared/src/errors.rs:111), identical to KineticRouterError::AssetNotActive
+            // (errors.rs:8). The generated router client therefore DECODES code #2 as
+            // `AssetNotActive`, even though the real cause is the active-reserve guard. We
+            // assert on the raw decoded variant so the test is unambiguous about which
+            // contract-error number actually fired.
+            assert!(
+                matches!(drop_res, Err(Ok(kinetic_router::KineticRouterError::AssetNotActive))),
+                "drop_reserve must revert with contract-error code #2 \
+                 (CannotDropActiveReserve, surfaced as AssetNotActive due to the code collision); \
+                 got {:?}",
+                drop_res
+            );
+            println!(
+                "HYPOTHESIS CONFIRMED: drop_reserve(D) BLOCKED (a_token scaled supply = {} != 0) \
+                 while deficit = {} remains live. The dangerous state \
+                 {{a==0 && debt==0 && deficit>0}} is UNREACHABLE here: the un-written-down \
+                 supplier aTokens keep scaled_total_supply > 0, so the deficit-erasing branch \
+                 of drop_reserve (reserve.rs:496-499) cannot be exercised. Severity: QA / \
+                 Informational (defensive deficit check recommended, but no live exploit). \
+                 (Side observation: the revert code #2 is shared by CannotDropActiveReserve \
+                 and AssetNotActive — a separate, cosmetic error-code-collision QA item.)",
+                a_scaled_after_withdraw_attempt, deficit_after_drop
+            );
+        }
+    }
+}
