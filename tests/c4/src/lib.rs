@@ -519,6 +519,181 @@ fn test_submission_validity() {
 }
 
 // =============================================================================
+// PoC — T1 bitmap reserve-index collision re-verification (fresh eyes).
+//
+// Hypothesis under test (cross-pollinated from EVM swap-and-pop index reuse and
+// Solana account re-init after close): after drop_reserve frees a reserve, can a
+// newly registered reserve REUSE the freed UserConfiguration bitmap bit position,
+// so a user's STALE bit (set on the dropped reserve) reads as participation in the
+// NEW reserve -> phantom collateral / hidden debt -> broken HF?
+//
+// We deliberately exercise the weakest link: set_user_use_reserve_as_coll lets a
+// user set the collateral bit with ZERO aToken balance (router.rs:1276), so the
+// stale bit survives drop_reserve's zero-scaled-supply guard. We then register a
+// fresh reserve and check whether its bit position collides with the stale bit.
+//
+// EXPECTED (if the prior "collision dead" conclusion is correct): the new reserve
+// gets a strictly higher monotonic id (different bit), and the stale bit maps to a
+// removed RESERVE_ID_TO_ADDRESS entry so HF accounting ignores it entirely.
+// =============================================================================
+
+/// Register a brand-new reserve at runtime (mirrors Setup::register_reserve but
+/// callable mid-test). Returns (underlying, a_token, debt_token).
+fn register_extra_reserve<'a>(
+    env: &'a Env,
+    setup: &Setup<'a>,
+    ltv: u32,
+    liquidation_threshold: u32,
+) -> (Address, Address, Address) {
+    let underlying_admin = Address::generate(env);
+    let underlying = env.register_stellar_asset_contract_v2(underlying_admin);
+    let underlying_addr = underlying.address();
+
+    let a_token_addr = env.register(a_token::WASM, ());
+    a_token::Client::new(env, &a_token_addr).initialize(
+        &setup.admin,
+        &underlying_addr,
+        &setup.router_addr,
+        &String::from_str(env, "aToken"),
+        &String::from_str(env, "aTKN"),
+        &ASSET_DECIMALS,
+    );
+    let debt_token_addr = env.register(debt_token::WASM, ());
+    debt_token::Client::new(env, &debt_token_addr).initialize(
+        &setup.admin,
+        &underlying_addr,
+        &setup.router_addr,
+        &String::from_str(env, "debtToken"),
+        &String::from_str(env, "dTKN"),
+        &ASSET_DECIMALS,
+    );
+    let reserve_treasury = Address::generate(env);
+    let params = kinetic_router::InitReserveParams {
+        decimals: ASSET_DECIMALS,
+        ltv,
+        liquidation_threshold,
+        liquidation_bonus: 500,
+        reserve_factor: 1000,
+        supply_cap: 0,
+        borrow_cap: 0,
+        borrowing_enabled: true,
+        flashloan_enabled: true,
+    };
+    setup.router.init_reserve(
+        &setup.pool_configurator,
+        &underlying_addr,
+        &a_token_addr,
+        &debt_token_addr,
+        &setup.interest_rate_strategy,
+        &reserve_treasury,
+        &params,
+    );
+    let asset_enum = OracleAsset::Stellar(underlying_addr.clone());
+    setup.oracle.add_asset(&setup.admin, &asset_enum);
+    setup.oracle.set_manual_override(
+        &setup.admin,
+        &asset_enum,
+        &Some(PRICE_ONE_DOLLAR),
+        &Some(env.ledger().timestamp() + 604_800),
+    );
+    (underlying_addr, a_token_addr, debt_token_addr)
+}
+
+#[test]
+fn poc_bitmap_drop_reregister_index_reuse() {
+    let env = Env::default();
+    let setup = Setup::new(&env);
+
+    // Reserves A and B already exist with ids 0 and 1 (bits 0 and 1).
+    let id_a = setup.router.get_reserve_data(&setup.asset_a).id;
+    let id_b = setup.router.get_reserve_data(&setup.asset_b).id;
+    assert_eq!(id_a, 0, "asset_a should be reserve id 0");
+    assert_eq!(id_b, 1, "asset_b should be reserve id 1");
+
+    // ---- Step 1: register reserve C (id 2, bit 2). ----
+    let (asset_c, _a_c, _d_c) = register_extra_reserve(&env, &setup, 8000, 8500);
+    let id_c = setup.router.get_reserve_data(&asset_c).id;
+    assert_eq!(id_c, 2, "asset_c should be reserve id 2");
+
+    // ---- Step 2: user sets C's COLLATERAL bit with ZERO balance. ----
+    // This is the crack: set_user_use_reserve_as_coll does not require any aToken
+    // balance, so the bit can be set on a reserve the user never supplied to.
+    // It therefore survives drop_reserve's zero-scaled-supply guard.
+    setup
+        .router
+        .set_user_use_reserve_as_coll(&setup.user, &asset_c, &true);
+
+    // Sanity: with no balance and no debt, HF is still MAX (bit set but worthless).
+    let acct_before = setup.router.get_user_account_data(&setup.user);
+    assert_eq!(acct_before.total_collateral_base, 0, "no real C collateral");
+    assert_eq!(acct_before.health_factor, u128::MAX, "no debt -> HF MAX");
+
+    // ---- Step 3: drop reserve C (scaled supply == 0, so guard passes). ----
+    setup
+        .router
+        .drop_reserve(&setup.pool_configurator, &asset_c);
+    // C's id->address mapping is now removed; the user's stale bit-2 persists.
+    assert!(
+        setup.router.try_get_reserve_data(&asset_c).is_err(),
+        "reserve C should be gone after drop",
+    );
+
+    // ---- Step 4: register a NEW reserve D and see which bit it takes. ----
+    let (asset_d, _a_d, _d_d) = register_extra_reserve(&env, &setup, 8000, 8500);
+    let id_d = setup.router.get_reserve_data(&asset_d).id;
+
+    // CORE ASSERTION: the freed id/bit (2) is NOT reused. D gets a strictly higher,
+    // fresh monotonic id. No bit-position collision is possible.
+    assert_eq!(
+        id_d, 3,
+        "BITMAP COLLISION: new reserve reused freed id {} (got id {}). \
+         If this were id 2, the user's stale bit would phantom-collateralize D.",
+        id_c, id_d
+    );
+    assert_ne!(id_d, id_c, "new reserve must not reuse the dropped reserve's id");
+
+    // ---- Step 5: confirm the new reserve D also starts clean (index == RAY). ----
+    let rd_d = setup.router.get_reserve_data(&asset_d);
+    assert_eq!(rd_d.liquidity_index, RAY_U128, "D liquidity_index == RAY");
+    assert_eq!(
+        rd_d.variable_borrow_index,
+        RAY_U128,
+        "D variable_borrow_index == RAY"
+    );
+
+    // ---- Step 6: prove the stale bit-2 cannot inflate borrowing power against D. ----
+    // Give the user REAL collateral in D, borrow against it to the limit, and verify
+    // the stale C bit (bit 2, now mapping to nothing) contributes ZERO collateral.
+    // We supply to D by minting D's underlying to the user and approving the router.
+    let asset_d_mint = token::StellarAssetClient::new(&env, &asset_d);
+    let asset_d_token = token::Client::new(&env, &asset_d);
+    asset_d_mint.mint(&setup.user, &USER_STARTING_BALANCE);
+    let exp = env.ledger().sequence() + 100_000;
+    asset_d_token.approve(&setup.user, &setup.router_addr, &USER_STARTING_BALANCE, &exp);
+    let d_supply: u128 = 1_000_000_000; // 100 tokens @ $1
+    setup
+        .router
+        .supply(&setup.user, &asset_d, &d_supply, &setup.user, &0u32);
+
+    let acct_after = setup.router.get_user_account_data(&setup.user);
+    // total_collateral_base is denominated in the oracle's value base (14-dp $),
+    // not raw token units. 100 tokens @ $1 == 100 * 1e18 in WAD base value.
+    // The exact single-count value proves the stale bit-2 (set on dropped C) adds
+    // nothing: if it were mis-attributed to D we'd see ~2x this, and if it resolved
+    // to a live-but-wrong asset we'd see a different magnitude or a panic.
+    let expected_collateral_base: u128 = 100 * WAD_U128; // 100 tokens * $1 in WAD
+    assert_eq!(
+        acct_after.total_collateral_base, expected_collateral_base,
+        "stale dropped-reserve bit must contribute ZERO extra collateral; \
+         got {} expected {} (phantom collateral would inflate this ~2x)",
+        acct_after.total_collateral_base, expected_collateral_base
+    );
+
+    // And the stale bit didn't break HF math either (still finite & sane with no debt).
+    assert_eq!(acct_after.health_factor, u128::MAX, "no debt -> HF MAX, no corruption");
+}
+
+// =============================================================================
 // Dynamic invariant fuzz (audit Round 5 — dynamic lens).
 // Drives a deterministic pseudo-random sequence of supply/borrow/withdraw/repay
 // across both reserves with interest accrual between ops, asserting the crown
